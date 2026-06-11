@@ -1,0 +1,341 @@
+---
+title: "DE testing"
+author: "Kaspar Bresser"
+output: 
+  github_document:
+    toc: true
+ # html_document: 
+#    theme: simplex
+#    highlight: pygments
+#    code_folding: show
+#    self_contained: TRUE
+#    toc: yes
+#    toc_float:
+#      collapsed: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+                      fig.width = 7,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+
+```{r loading, echo=FALSE}
+library(rstatix)
+library(ggpubr)
+library(gghighlight)
+library(lemon)
+library(RColorBrewer)
+library(edgeR)
+library(tidyverse)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+```
+
+
+## Import and inspect
+
+Import reads
+
+```{r filter_aligned}
+read.counts <- read_tsv( "Output/scRNAseq_pseudobulked_readcounts.tsv") %>% mutate(Patient = str_remove(Patient, "_"))
+```
+
+pivot to wide data
+
+```{r}
+read.counts %>% 
+ # filter(population != "DN") %>% 
+  filter(Patient != "NSCLC37") %>% 
+  pivot_wider(names_from = c(Patient, population), values_from = count) -> read.counts.wide
+  
+```
+
+
+Generate DGE object
+
+```{r}
+DGE.object <- DGEList(counts = read.counts.wide[2:22], 
+                      genes = pull(read.counts.wide, gene))
+```
+
+
+Filter low expression
+
+```{r}
+countsPerMillion <- as.data.frame(cpm(DGE.object), row.names =  pull(read.counts.wide, gene))
+
+thresh <- countsPerMillion > 4
+table(rowSums(thresh))
+
+summary(rowSums(thresh) >= 5)
+```
+
+extract CPM
+
+```{r}
+DGE.object <- DGE.object[rowSums(thresh) >= 5, , keep.lib.sizes=FALSE]
+DGE.object <- calcNormFactors(DGE.object)
+
+countsPerMillion <- as.data.frame(cpm(DGE.object, normalized.lib.sizes = T, log = T), 
+                                  row.names = DGE.object$genes$genes)
+```
+
+
+## PCA
+
+get variance
+
+```{r}
+var_genes <- apply(countsPerMillion, 1, var)
+head(var_genes)
+```
+
+select top 1,000, perform PCA
+
+```{r}
+select_var <- names(sort(var_genes, decreasing=TRUE))[1:1000]
+countsPerMillion <- countsPerMillion[select_var, ]
+
+countsPerMillion %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  prcomp(center = T, scale = F) -> pca
+
+str(pca)
+```
+
+Plot PCA
+
+```{r fig.width=4, fig.asp=.8}
+pca %>% 
+  augment() %>% 
+  separate(.rownames, into = c("Patient", "population")) %>% 
+  mutate(population = factor(population, levels = c("DN", "SP", "DP"))) %>% 
+ggplot(aes(x = .fittedPC1, y = .fittedPC2))+
+  geom_point( size = 3, shape = 21, aes( fill = population))+
+     stat_ellipse(geom = "polygon",
+               aes(fill = paste( population)), 
+               alpha = .2)+
+  scale_fill_manual(values = c("grey", "#fc9272","#cb181d"))+
+  ggtitle("PCA 1000 most variable genes")+
+  theme_classic()+
+  theme(panel.grid.major = element_line(color = "grey90"))+
+  guides(fill = guide_legend("timepoint", override.aes = list(shape = 21)))
+```
+
+
+Plot heatmap
+
+```{r}
+select_var <- names(sort(var_genes, decreasing=TRUE))[1:1000]
+countsPerMillion <- countsPerMillion[select_var,]
+
+as.data.frame(pca$x) %>% 
+  rownames_to_column("sample") %>% 
+  separate(sample, into = c("donor", "population"), remove = F) %>% 
+  dplyr::select(sample, donor,  population) %>% 
+#  filter(population != "GFPpos") %>% 
+  column_to_rownames("sample") -> annotation
+
+annotation
+```
+
+
+```{r fig.asp=.8, fig.width=9}
+library(pheatmap)
+
+countsPerMillion %>% 
+#  select(!contains("GFPpos")) %>% 
+pheatmap(scale = "row",breaks = seq(-2,2,by=0.04), 
+         clustering_distance_cols = "correlation" , 
+         annotation_col = annotation, show_rownames = F,
+         border_color = NA, clustering_distance_rows = "euclidean", 
+         main = "1000 most variable genes", cutree_cols = 2, cutree_rows = 2)
+```
+
+
+
+
+
+## DE analysis - edgeR
+
+Set up design
+
+```{r}
+DGE.object$group <- rep(c("DN", "DP", "SP"), 7)
+g <- factor((DGE.object$group))
+
+
+# Set design for comparison
+design <- model.matrix(~ 0 + g)
+colnames(design) <- levels(g)
+
+design
+
+# Estimate dispersions
+DGE.object <- estimateDisp(DGE.object, design, robust=TRUE)
+
+plotMDS(DGE.object)
+```
+
+
+estimate fit, and test for DP versus SP contrast
+
+```{r}
+fit <- glmQLFit(DGE.object, design)
+
+my.contrasts <- makeContrasts(DPvSP = DP-SP, levels=design)
+
+
+qlf <- glmQLFTest(fit, contrast = my.contrasts[,"DPvSP"])
+
+plotMD(qlf)
+```
+
+extract and output results
+
+
+```{r}
+qlf$table %>% 
+  as_tibble() %>% 
+  mutate(gene = DGE.object$genes$genes) %>% 
+  mutate(FDR = p.adjust(PValue, method = "fdr")) -> DE.results
+
+DE.results
+
+write_tsv(DE.results, "Output/scRNAseq_DE_results.tsv")
+```
+
+
+## GSEA 
+
+Set up gene list
+
+```{r}
+gene.list <- DE.results %>%
+  arrange(desc(logFC)) %>%
+  mutate(ENTREZID = mapIds(org.Hs.eg.db,
+                           keys = gene,
+                           keytype = "SYMBOL",
+                           column = "ENTREZID")) %>%
+  filter(!is.na(ENTREZID)) %>%
+  dplyr::select(ENTREZID, logFC)
+
+# Named numeric vector for GSEA
+gene.list.vec <- gene.list$logFC
+names(gene.list.vec) <- gene.list$ENTREZID
+```
+
+run GSEA on Biological Process (GO)
+
+```{r}
+gsea.res <- gseGO(
+  geneList = sort(gene.list.vec, decreasing = TRUE),
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  keyType = "ENTREZID",
+  pvalueCutoff = 0.05
+)
+
+dotplot(gsea.res, showCategory = 15)
+```
+
+Check ImmuneSigDB
+
+
+```{r fig.asp=1}
+library(msigdbr)
+
+# Get human immunologic signatures
+m.t2 <- msigdbr(species = "Homo sapiens", collection = "C7")
+
+# Convert to list for clusterProfiler
+m.t2 <-  m.t2[, c("gs_name", "gene_symbol")]
+
+
+# Keep only pathways containing "TCELL"
+m.t2 <- m.t2 %>%
+  filter(grepl("TCELL", gs_name, ignore.case = TRUE))
+
+
+gene.list.vec <- DE.results$logFC
+names(gene.list.vec) <- DE.results$gene
+gene.list.vec <- sort(gene.list.vec, decreasing = TRUE)
+
+# Run GSEA
+gsea.res <- GSEA(
+  geneList = gene.list.vec, # logFC ranked
+  TERM2GENE = m.t2,
+  pvalueCutoff = 0.05
+)
+```
+
+
+Then plot individual pathways
+
+```{r fig.width=4, fig.asp=.7}
+library(enrichplot)
+gseaplot2(gsea.res, geneSetID = c("GSE24081_CONTROLLER_VS_PROGRESSOR_HIV_SPECIFIC_CD8_TCELL_DN",
+                                  "GSE24081_CONTROLLER_VS_PROGRESSOR_HIV_SPECIFIC_CD8_TCELL_UP"), 
+          title = "CONTROLLER_VS_PROGRESSOR_HIV_SPECIFIC_CD8_TCEL", pvalue_table = F,
+          subplots = 1)+
+  geom_hline(yintercept = 0, linetype = "solid")+
+  theme(legend.position = "bottom")
+
+ggsave("Figs/scRNAseq_DPvsSP_HIV.pdf", width = 5, height = 4)
+```
+
+
+```{r fig.width=4, fig.asp=.7}
+gseaplot2(gsea.res, geneSetID = c("GSE30962_ACUTE_VS_CHRONIC_LCMV_PRIMARY_INF_CD8_TCELL_DN",
+                                  "GSE30962_ACUTE_VS_CHRONIC_LCMV_PRIMARY_INF_CD8_TCELL_UP"), 
+          title = "ACUTE_VS_CHRONIC_LCMV_PRIMARY_INF_CD8_TCELL", pvalue_table = F,
+          subplots = c(1))+
+  geom_hline(yintercept = 0, linetype = "solid")+
+  theme(legend.position = "bottom", panel.grid.major.y = element_line())
+
+ggsave("Figs/scRNAseq_DPvsSP_LCMV.pdf", width = 5, height = 4)
+```
+
+
+## plot genes
+
+```{r}
+dat.cpm <- as.data.frame(cpm(DGE.object, normalized.lib.sizes = T, log = T), 
+                                  row.names = DGE.object$genes$genes) %>% as_tibble(rownames = "gene")
+```
+
+
+```{r fig.asp=.9}
+imm.genes <- c('ITGAE', 'ENTPD1',  'HAVCR2', 'PDCD1', "TIGIT", 'TOX',
+               "MKI67", "CDK4",'CXCL13', "IL17A", "IL2", "TNF",
+                "LEF1", 'TCF7','GZMK', "IL7R", "CCR7", "JUNB" )
+
+dat.cpm %>% 
+  filter(gene %in% imm.genes) %>% 
+  pivot_longer(-gene, names_to = "sample", values_to = "CPM") %>% 
+  separate(sample, into = c("Patient", "population")) %>% 
+  mutate(population = factor(population, levels = c("DN", "SP", "DP"))) %>% 
+  mutate(gene = factor(gene, levels = imm.genes)) %>% 
+ggplot(aes(x= population, y = CPM, fill = population))+
+  geom_boxplot(outlier.shape = NA, color ="black")+
+  geom_jitter(width = 0.15, size = 1.75, shape = 21)+
+  facet_rep_wrap(~gene, scales = "free", nrow =3)+
+  scale_fill_manual(values = c("grey", "#fc9272","#cb181d"))+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line(color = "grey90"))
+
+ggsave("Figs/scRNAseq_examples_pseudobulk.pdf", width = 7, height = 5)
+```
+
+
+
+
+

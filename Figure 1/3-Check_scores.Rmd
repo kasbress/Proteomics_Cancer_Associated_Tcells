@@ -1,0 +1,351 @@
+---
+title: "scRNAseq NSCLC cyt/dys scores"
+author: "Kaspar Bresser"
+date: "18/012/2025"
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+Comparative analysis of the cytotoxicity/dysfunction gene-scores to the CITE-seq antibody stainings
+
+```{r loading, echo=TRUE}
+library(Seurat)
+library(metacell)
+library(tidyverse)
+library(lemon)
+library(ggpubr)
+library(rstatix)
+```
+
+
+## Import data
+
+Import the MetaCell object
+
+```{r import_mc}
+scdb_init("Data")
+mc <- scdb_mc("NSCLC_MC_reordered")
+
+```
+
+
+Extract the patient info from the mat object
+
+```{r get_hashtags}
+mat.obj <- scdb_mat("NSCLC_filt")
+
+mat.obj@cell_metadata %>% 
+  select(Patient) %>% 
+  as_tibble(rownames = "cellcode") -> patients
+
+patients
+```
+
+
+## Gene expression 
+
+Import Seurat object and Normalize the data
+
+
+```{r}
+seurat.obj <- read_rds("Data/CD8_NSCLC_filt.rds")
+seurat.obj <- NormalizeData(seurat.obj, assay = "RNA", normalization.method = "CLR")
+```
+
+Define function to extract counts per gene per cellcode from the seurat object
+
+
+```{r}
+get_expression <- function(gene.list){
+  
+ seurat.obj %>% 
+  GetAssayData( layer = "data", assay = "RNA")%>% 
+  t() %>% 
+  as.data.frame() %>% 
+  as_tibble(rownames = "cellcode") %>% 
+  select(one_of(c("cellcode", gene.list)))
+  
+}
+```
+
+
+
+
+## Check scores by surface expression
+
+
+get the CITEseq information
+
+```{r}
+mat.obj@cell_metadata %>% 
+  as_tibble(rownames = "cellcode") %>% 
+  select(cellcode, contains("UMIA")) -> CITE
+
+CITE
+```
+
+Normalize the CITEseq counts between patients and take the median of each CITEseq antibody per MetaCell
+
+```{r}
+MC.ids <- enframe(mc@mc, name = "cellcode", value = "MetaCell") %>% mutate(MetaCell = as.character(MetaCell))
+
+CITE %>% 
+  inner_join(MC.ids) %>% 
+  inner_join(patients) %>% 
+  group_by(Patient) %>% 
+  mutate(across(contains("UMIA"), ~(((.+1)/sum(.))*10000))) %>% 
+  group_by(MetaCell, Patient) %>% 
+  summarise(across(contains("UMIA"), median),
+            n = n()) -> average.CITE
+
+average.CITE
+```
+
+
+Visualize per patient, and set some cutoffs (manually determined)
+
+
+```{r}
+cutoffs <- tibble(Patient = unique(average.CITE$Patient),
+                   CD39 = c(3, 2.5, 2.5, 3.5, 6.5, 5, 1.5, 150),
+                   CD103 = c(2.5, 2, 1, 2.8, 2.5, 3, 0.5, 100))
+```
+
+Plot 
+
+```{r fig.asp=.65, fig.width=6}
+average.CITE %>% 
+#  filter(Patient != "NSCLC_37") %>% 
+  mutate(Patient = factor(Patient, levels = unique(Patient))) %>% 
+  ggplot(aes(x = UMIA.CD39, y = UMIA.CD103))+
+  geom_point(aes(size = n, fill = as.character(MetaCell)), shape = 21, color = "black")+
+  facet_rep_wrap(~Patient, nrow = 2, repeat.tick.labels = T, scales = "free")+
+  theme_classic()+
+  scale_y_log10(expand = expansion(mult = c(0.1, .05)))+
+  scale_x_log10(expand = expansion(mult = c(0.1, .05)))+
+  geom_hline(data = cutoffs, aes(yintercept = CD103), linetype = "dotted")+
+  geom_vline(data = cutoffs, aes(xintercept = CD39), linetype = "dotted")+
+  theme(legend.position = "none")
+
+ggsave(filename = "Figs/Populations_definition.pdf", width = 11, height = 6, useDingbats = F, scale = .5)
+```
+
+
+
+## Dysfunction/Cytox signature
+
+Import dysfunction signature
+
+```{r }
+imm.genes <- read_table("Data/dysfunction_score.txt") %>% pull(Gene)
+```
+
+Get expression of these genes.
+
+```{r}
+expression.data.dys <- get_expression(imm.genes)
+```
+
+
+Calculate dysfunction score from signature
+
+```{r}
+
+mc@mc %>% 
+  enframe(name = "cellcode", value = "MetaCell") %>% 
+  inner_join(patients) %>% 
+  inner_join(expression.data.dys) %>% 
+  mutate(MetaCell = factor(MetaCell, levels = as.character(1:85))) %>% 
+  pivot_longer(cols = any_of(imm.genes), names_to = "Gene", values_to = "count") %>% 
+  group_by(MetaCell, Patient) %>% 
+  summarise(dys.score = (sum(count)/n())*1000) -> dysfunction.scores
+```
+
+Get cytox signature
+
+```{r get_expression}
+imm.genes <- read_table("Data/cytotox_score.txt") %>% pull(Gene)
+```
+
+
+Get expression of these genes.
+
+```{r}
+expression.data.cytox <- get_expression(imm.genes)
+```
+
+Calculate Cytox score
+
+
+```{r}
+mc@mc %>% 
+  enframe(name = "cellcode", value = "MetaCell") %>% 
+  inner_join(patients) %>% 
+  inner_join(expression.data.cytox) %>% 
+  mutate(MetaCell = factor(MetaCell, levels = as.character(1:85))) %>% 
+  pivot_longer(cols = any_of(imm.genes), names_to = "Gene", values_to = "count") %>% 
+  group_by(MetaCell, Patient) %>% 
+  summarise(cytox.score = (sum(count)/n())*1000) -> cytox.scores
+```
+
+
+## correlation with CITE-seq
+
+combine with CITE-seq data and calculate correlations
+
+```{r}
+average.CITE %>% 
+  filter(Patient != "NSCLC_37") %>% 
+  ungroup() %>% 
+  inner_join(dysfunction.scores) %>% 
+  inner_join(cytox.scores) %>% 
+  select(-UMIA.CD4.1) %>% 
+  filter(n > 5) %>% 
+  group_by(Patient) %>% 
+#  count()
+  cor_test(vars = contains("UMI"), vars2 = contains("score"), method = "spearman") %>% 
+  adjust_pvalue() -> cor.stats
+
+write_tsv(cor.stats, "Output/scRNAseq_Correlations_Scores_ADT.tsv")
+
+cor.stats
+```
+
+
+Plot
+
+```{r}
+cor.stats %>% 
+  mutate(var1 = fct_reorder(var1, p, median)) %>% 
+  ggplot(aes(x = var1, y = cor))+
+  geom_boxplot()+
+  geom_point(shape = 21, position = position_jitter(width = .1), aes(fill = var2))+
+  facet_rep_wrap(~var2)+
+  scale_fill_manual(values = c("green4", "red4"))+
+  geom_hline(yintercept = 0)+
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        panel.grid.major.y = element_line(color = "grey90"), legend.position = "bottom")
+
+ggsave("Figs/scRNAseq_scores_correlation_boxes.pdf", width = 4, height = 3)
+```
+
+
+
+
+```{r fig.asp=.45, fig.width=9}
+average.CITE %>% 
+  inner_join(dysfunction.scores) %>% 
+  mutate(dys.score = case_when(dys.score > 600 ~ 600, TRUE ~ dys.score)) %>% 
+  filter(Patient != "NSCLC_37") %>% 
+  filter(n > 5) %>% 
+  mutate(Patient = factor(Patient, levels = unique(Patient))) %>% 
+  arrange(dys.score) %>% 
+  ggplot(aes(x = UMIA.CD39, y = UMIA.CD103))+
+  geom_point(aes(size = n, fill = (dys.score)), shape = 21, color = "black")+
+  facet_rep_wrap(~Patient, nrow = 2, repeat.tick.labels = T, scales = "free")+
+  theme_classic()+
+  scale_y_log10(expand = expansion(mult = c(0.1, .05)))+
+  scale_x_log10(expand = expansion(mult = c(0.1, .05)))+
+  geom_hline(data = cutoffs, aes(yintercept = CD103), linetype = "dotted")+
+  geom_vline(data = cutoffs, aes(xintercept = CD39), linetype = "dotted")+
+ # scale_fill_gradient(low = "white", high = "red4")
+  scale_fill_viridis_c(option = "plasma")
+
+ggsave(filename = "Figs/scRNAseq_Populations_definition_dys.pdf", width = 11, height = 6, useDingbats = F, scale = .5)
+```
+
+```{r fig.asp=.7, fig.width=4}
+average.CITE %>% 
+  inner_join(dysfunction.scores) %>%
+  inner_join(cytox.scores) %>% 
+  filter(Patient != "NSCLC_37") %>% 
+  group_by(MetaCell) %>% 
+  summarise(n = sum(n), UMIA.CD39 = median(UMIA.CD39), UMIA.CD103 = median(UMIA.CD103), 
+            dys.score = median(dys.score), cytox.score = median(cytox.score)) %>% 
+  mutate(dys.score = case_when(dys.score > 600 ~ 600, TRUE ~ dys.score)) %>% 
+  arrange(n) -> for.plot 
+
+write_tsv(for.plot, "Output/scRNAseq_DysCytox_scores_CD39CD103.tsv")
+
+```
+
+
+Plot summarised scores
+
+
+```{r fig.width=4}
+p1 <- ggplot(for.plot, aes(x = UMIA.CD39, y = dys.score))+
+  geom_point(size = 2, shape = 21, fill = "red4")+
+  theme_classic()+
+  scale_x_log10(expand = expansion(mult = c(0.1, .05)))+
+  theme(panel.grid.major = element_line(color = "grey90"))
+
+p2 <- ggplot(for.plot, aes(x = UMIA.CD103, y = dys.score))+
+  geom_point(size = 2, shape = 21, fill = "red4")+
+  theme_classic()+
+  scale_x_log10(expand = expansion(mult = c(0.1, .05)))+
+  theme(panel.grid.major = element_line(color = "grey90"))
+
+p3 <- ggplot(for.plot, aes(x = UMIA.CD39, y = cytox.score))+
+  geom_point(size = 2, shape = 21, fill = "green4")+
+  theme_classic()+
+  scale_x_log10(expand = expansion(mult = c(0.1, .05)))+
+  theme(panel.grid.major = element_line(color = "grey90"))
+
+p4 <- ggplot(for.plot, aes(x = UMIA.CD103, y = cytox.score))+
+  geom_point(size = 2, shape = 21, fill = "green4")+
+  theme_classic()+
+  scale_x_log10(expand = expansion(mult = c(0.1, .05)))+
+  theme(panel.grid.major = element_line(color = "grey90"))
+```
+
+
+
+```{r fig.width=5}
+ggarrange(plotlist = list(p1,p2,p3,p4), common.legend = T, legend = "bottom" )
+
+ggsave("Figs/scRNAseq_scores_makers_by_scores.pdf", height = 3.7, width = 4)
+```
+
+
+
+
+```{r}
+ggplot(for.plot, aes(x = UMIA.CD39, y = UMIA.CD103))+
+  geom_point(aes(fill = dys.score), size = 2.5, shape = 21, color = "black")+
+  theme_classic()+
+  scale_x_log10(expand = expansion(mult = c(0.1, .05)))+
+  scale_y_log10(expand = expansion(mult = c(0.1, .05)))+
+  scale_fill_viridis_c(option = "plasma")+
+  geom_hline(yintercept = 1.0, linetype = "dotted")+
+  geom_vline(xintercept = 3, linetype = "dotted")+
+  theme(panel.grid.major = element_line(color = "grey90"))
+  
+ggsave("Figs/scRNAseq_scores_makers_by_dys_simple.pdf", height = 2, width = 3.1)
+```
+
+
+
+
