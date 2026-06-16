@@ -1,0 +1,221 @@
+---
+title: "Compare bulkRNA and protein data"
+author: "Kaspar Bresser"
+date: "14/08/2025"
+output: 
+  github_document:
+    toc: true
+  html_document: 
+    theme: simplex
+    highlight: pygments
+#    code_folding: show
+    self_contained: TRUE
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      autodep  = TRUE,
+                      cache = FALSE,
+                      fig.width = 5,
+                      fig.asp = 0.618,
+                      fig.align = "center")
+```
+
+
+
+```{r loading, echo=FALSE}
+library(tidyverse)
+library(lemon)
+library(readxl)
+library(limma)
+library(ggrastr)
+library(gghighlight)
+library(rstatix)
+```
+
+
+Make some example vizualisations 
+
+##
+
+Import data
+
+
+```{r}
+dat.combined <- read_tsv( "Output/data_combined.tsv")
+dat.DE.all <- read_tsv("Output/data_DE_all.tsv")
+
+```
+
+
+
+## Selected proteins
+
+Plot proteins that were selected for follow-up
+
+
+```{r fig.width=11, fig.asp=.35}
+prots <-  c("FASN", "CHD4", "DDX3X", "TPP2", "HMGN4", "PTGES2",  "CRYZ", "APEX1", "PRCP",
+            "ACAT2", "ACLY", "CAPRIN1", "PTPN22", "STAT3")
+
+dat.combined %>% 
+  dplyr::filter(gene %in% prots) %>% 
+  mutate(gene = factor(gene, levels = prots), count = log2(count)) %>% 
+  pivot_longer(cols = c(abundance, count), names_to = "metric", values_to = "value") %>% 
+ggplot(aes(x = condition, y = value))+
+  geom_boxplot(aes(fill = condition))+
+  geom_jitter(aes(fill = condition), shape = 21, size = 2, width = .1)+
+  scale_fill_manual(values = rev(c("#cb181d", "#fc9272", "lightblue")))+
+  facet_rep_wrap(metric~gene, scales = "free", nrow = 2)+
+  theme_classic()+
+  theme(panel.grid.major = element_line(color = "grey90"), legend.title = element_blank(), 
+        strip.background = element_blank(), legend.position = "bottom", axis.text.x = element_blank())
+
+ggsave("Figs/MSvRNA_boxplots_selection.pdf", width = 12, height = 4)
+```
+
+Specifically plot tumor-derived populations
+
+```{r fig.width=11, fig.asp=.35}
+dat.combined %>% 
+  filter(str_detect(condition, "Tumor")) %>% 
+  dplyr::filter(gene %in% prots) %>% 
+  mutate(gene = factor(gene, levels = prots), count = log2(count)) %>% 
+  pivot_longer(cols = c(abundance, count), names_to = "metric", values_to = "value") %>% 
+ggplot(aes(x = condition, y = value))+
+  geom_boxplot(aes(fill = condition))+
+  geom_jitter(aes(fill = condition), shape = 21, size = 2, width = .1)+
+  scale_fill_manual(values = rev(c("#cb181d", "#fc9272")))+
+  facet_rep_wrap(metric~gene, scales = "free", nrow = 2)+
+  theme_classic()+
+  theme(panel.grid.major = element_line(color = "grey90"), legend.title = element_blank(), 
+        strip.background = element_blank(), legend.position = "bottom", axis.text.x = element_blank())
+
+#ggsave("Figs/dotplots_correlation.pdf", width = 3.8, height = 2.7)
+```
+
+
+## Correlations
+
+Calculate Spearman correlation between protein abundance and gene counts
+
+```{r}
+dat.combined %>% 
+  group_by(gene) %>%
+  mutate(count = log2(count)) %>% 
+  cor_test(count, abundance, method = "spearman") -> dat.cors
+```
+
+Combine with DE data
+
+```{r}
+dat.cors %>% 
+  dplyr::select(gene, cor, p) %>% 
+  inner_join(dat.DE.all, by = c("gene" = "gene.symbol")) -> dat.all.stats
+```
+
+
+```{r}
+dat.all.stats %>% 
+  filter(P.Value.prot < 0.05 & p > 0.05)
+```
+
+
+Output stats 
+
+```{r}
+write_tsv(dat.all.stats, "Output/data_DEandCors.tsv")
+```
+
+
+
+
+Check out some interesting proteins
+
+```{r fig.width=7, fig.asp=.55}
+prots <- c("ANXA1",  "ANXA2", "SP100", "MYO1E", "GZMA", "FASN",
+           "NFKB2", "PDLIM5", "MSH6", "PCNA", "GZMK", "TALDO1")
+
+dat.combined %>% 
+  dplyr::filter(gene %in% prots) %>% 
+  mutate(gene = factor(gene, levels = prots)) %>% 
+  ggplot(aes(x = log2(count), y = abundance))+
+  geom_point(aes(fill = condition), shape = 21, size = 2)+
+  scale_fill_manual(values = rev(c("#cb181d", "#fc9272", "lightblue")))+
+  facet_rep_wrap(~gene, scales = "free", nrow = 2)+
+  theme_classic()+
+  theme(panel.grid.major = element_line(color = "grey92"), legend.title = element_blank(), strip.background = element_blank(), legend.position = "bottom")+
+  labs(x = "RNA expression level", y = "protein expression level")
+
+ggsave("Figs/dotplots_correlation.pdf", width = 7, height = 3.5)
+```
+
+Make dot plots for selected genes to show correlation 
+
+
+```{r fig.width=14, fig.asp=.18}
+prots <- c("GZMA",  "GZMK", "AHNAK", "NFATC2", "STAT4", 
+           "NFKB2", "SUZ12",  "LYZ", "CD48")
+
+p1 <- dat.combined %>% 
+  dplyr::filter(gene %in% prots) %>% 
+  mutate(name = factor(gene, levels = prots)) %>% 
+ggplot(aes(x = log2(count), y = abundance))+
+  geom_point(aes(fill = condition), shape = 21, size = 2)+
+  scale_fill_manual(values = rev(c("#cb181d", "#fc9272", "lightblue")))+
+  facet_rep_wrap(~name, scales = "free", nrow = 1)+
+  theme_classic()+
+  theme(panel.grid.major = element_line(color = "grey92"), legend.title = element_blank(), strip.background = element_blank(), legend.position = "bottom")+
+  labs(x = "RNA expression level", y = "protein expression level")
+```
+
+
+Also make plots as boxes
+
+
+```{r fig.width=14, fig.asp=.35}
+
+
+p2 <- dat.combined %>% 
+  dplyr::filter(gene %in% prots) %>% 
+  mutate(gene = factor(gene, levels = prots), count = log2(count)) %>% 
+  pivot_longer(cols = c(abundance, count), names_to = "metric", values_to = "value") %>% 
+ggplot(aes(x = condition, y = value))+
+  geom_boxplot(aes(fill = condition))+
+  geom_jitter(aes(fill = condition), shape = 21, size = 2, width = .1)+
+  scale_fill_manual(values = rev(c("#cb181d", "#fc9272", "lightblue")))+
+  facet_rep_wrap(metric~gene, scales = "free", ncol = length(prots))+
+  theme_classic()+
+  theme(panel.grid.major.y = element_line(color = "grey90"), legend.title = element_blank(), 
+        strip.background = element_blank(), legend.position = "bottom", axis.text.x = element_blank())
+```
+
+
+Combine and visualize
+
+
+```{r fig.width=12}
+library(ggpubr)
+
+ggarrange(plotlist = list(p2, p1), nrow = 2, heights = c(2.15,1))
+
+
+ggsave("Figs/example_plots.pdf", width = 9.5, height = 6.5)
+```
+
+
+
+
+
+
+
+
+
+
